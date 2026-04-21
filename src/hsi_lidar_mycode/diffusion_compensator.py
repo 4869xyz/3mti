@@ -162,28 +162,46 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
         x0_pred = (x_t - sqrt_omb * eps_pred) / torch.clamp(sqrt_ab, min=1e-8)
         return x0_pred
 
-    def training_forward(self, target: torch.Tensor, condition: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def training_forward(
+        self,
+        target: torch.Tensor,
+        condition: torch.Tensor,
+        init_latent: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         if target.shape != condition.shape:
             raise ValueError(f"target/condition shape mismatch: {tuple(target.shape)} vs {tuple(condition.shape)}")
         if target.ndim != 4:
             raise ValueError(f"Expected 4D tensors [B,C,H,W], got {tuple(target.shape)}")
+        if init_latent is None:
+            init_latent = torch.zeros_like(target)
+        elif init_latent.shape != target.shape:
+            raise ValueError(
+                f"init_latent shape mismatch: {tuple(init_latent.shape)} vs target={tuple(target.shape)}"
+            )
 
-        bsz = target.shape[0]
+        # Residual diffusion: r0 = target - coarse mapper output.
+        target_residual = target - init_latent
+
+        bsz = target_residual.shape[0]
         timesteps = torch.randint(0, self.diffusion_steps, (bsz,), device=target.device, dtype=torch.long)
-        noise = torch.randn_like(target)
-        x_t = self.q_sample(target, timesteps, noise)
+        noise = torch.randn_like(target_residual)
+        x_t = self.q_sample(target_residual, timesteps, noise)
         eps_pred = self.noise_predictor(x_t, condition, timesteps)
         loss_noise = F.mse_loss(eps_pred, noise)
 
-        x0_pred = self.predict_x0_from_eps(x_t, timesteps, eps_pred)
+        residual_pred = self.predict_x0_from_eps(x_t, timesteps, eps_pred)
         if self.clip_x0 is not None:
-            x0_pred = x0_pred.clamp(-self.clip_x0, self.clip_x0)
+            residual_pred = residual_pred.clamp(-self.clip_x0, self.clip_x0)
+        x0_pred = init_latent + residual_pred
 
         return {
             "x_t": x_t,
             "timesteps": timesteps,
             "noise": noise,
             "eps_pred": eps_pred,
+            "residual_target": target_residual,
+            "residual_pred": residual_pred,
+            "init_latent": init_latent,
             "x0_pred": x0_pred,
             "loss_noise": loss_noise,
         }
@@ -208,10 +226,22 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
         return schedule
 
     @torch.no_grad()
-    def sample(self, condition: torch.Tensor, num_steps: Optional[int] = None) -> torch.Tensor:
+    def sample(
+        self,
+        condition: torch.Tensor,
+        num_steps: Optional[int] = None,
+        init_latent: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if condition.ndim != 4:
             raise ValueError(f"condition must be 4D [B,C,H,W], got {tuple(condition.shape)}")
+        if init_latent is None:
+            init_latent = torch.zeros_like(condition)
+        elif init_latent.shape != condition.shape:
+            raise ValueError(
+                f"init_latent shape mismatch: {tuple(init_latent.shape)} vs condition={tuple(condition.shape)}"
+            )
 
+        # Diffusion state is residual r_t.
         x_t = torch.randn_like(condition)
         schedule = self._build_sampling_schedule(num_steps=num_steps)
 
@@ -224,16 +254,16 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
                 dtype=torch.long,
             )
             eps_pred = self.noise_predictor(x_t, condition, timesteps)
-            x0_pred = self.predict_x0_from_eps(x_t, timesteps, eps_pred)
+            residual_pred = self.predict_x0_from_eps(x_t, timesteps, eps_pred)
 
             if self.clip_x0 is not None:
-                x0_pred = x0_pred.clamp(-self.clip_x0, self.clip_x0)
+                residual_pred = residual_pred.clamp(-self.clip_x0, self.clip_x0)
 
             if t_next < 0:
-                x_t = x0_pred
+                x_t = residual_pred
                 continue
 
             alpha_bar_next = self.alpha_bars[t_next].to(device=x_t.device, dtype=x_t.dtype)
-            x_t = torch.sqrt(alpha_bar_next) * x0_pred + torch.sqrt(1.0 - alpha_bar_next) * eps_pred
+            x_t = torch.sqrt(alpha_bar_next) * residual_pred + torch.sqrt(1.0 - alpha_bar_next) * eps_pred
 
-        return x_t
+        return init_latent + x_t

@@ -11,6 +11,13 @@ def alignment_loss(z_h: torch.Tensor, z_l: torch.Tensor, eps: float = 1e-8) -> t
     return (1.0 - cos).mean()
 
 
+def cosine_gap_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    pred_gap = F.adaptive_avg_pool2d(pred, output_size=1).flatten(1)
+    target_gap = F.adaptive_avg_pool2d(target, output_size=1).flatten(1)
+    cos = F.cosine_similarity(pred_gap, target_gap, dim=1, eps=eps)
+    return (1.0 - cos).mean()
+
+
 def total_stage2_loss(
     outputs: Dict[str, torch.Tensor],
     labels: torch.Tensor,
@@ -19,6 +26,8 @@ def total_stage2_loss(
     lambda_recon: float,
     lambda_align: float,
     lambda_refine: float,
+    lambda_map_recon: float = 0.0,
+    lambda_map_cos: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     loss_cls_full = F.cross_entropy(outputs["logits_full"], labels)
     loss_cls_hsi_missing = F.cross_entropy(outputs["logits_hsi_missing"], labels)
@@ -33,6 +42,19 @@ def total_stage2_loss(
     loss_align = alignment_loss(outputs["z_h"], outputs["z_l"])
     loss_refine = F.mse_loss(outputs["z_refined_full"], outputs["z_fused_full"].detach())
 
+    zero = outputs["logits_full"].new_zeros(())
+    if "z_h_map" in outputs and "z_l_map" in outputs:
+        loss_map_recon_h = F.l1_loss(outputs["z_h_map"], outputs["z_h"].detach())
+        loss_map_recon_l = F.l1_loss(outputs["z_l_map"], outputs["z_l"].detach())
+        loss_map_recon = 0.5 * (loss_map_recon_h + loss_map_recon_l)
+
+        loss_map_cos_h = cosine_gap_loss(outputs["z_h_map"], outputs["z_h"].detach())
+        loss_map_cos_l = cosine_gap_loss(outputs["z_l_map"], outputs["z_l"].detach())
+        loss_map_cos = 0.5 * (loss_map_cos_h + loss_map_cos_l)
+    else:
+        loss_map_recon = zero
+        loss_map_cos = zero
+
     loss = (
         loss_cls_full
         + lambda_cls_missing * loss_cls_missing
@@ -40,6 +62,8 @@ def total_stage2_loss(
         + lambda_recon * loss_recon
         + lambda_align * loss_align
         + lambda_refine * loss_refine
+        + lambda_map_recon * loss_map_recon
+        + lambda_map_cos * loss_map_cos
     )
 
     return {
@@ -52,6 +76,8 @@ def total_stage2_loss(
         "loss_recon": loss_recon,
         "loss_align": loss_align,
         "loss_refine": loss_refine,
+        "loss_map_recon": loss_map_recon,
+        "loss_map_cos": loss_map_cos,
     }
 
 
@@ -62,6 +88,8 @@ def total_stage2_single_missing_loss(
     lambda_recon: float,
     lambda_align: float,
     lambda_refine: float,
+    lambda_map_recon: float = 0.0,
+    lambda_map_cos: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     loss_cls_missing = F.cross_entropy(outputs["logits_missing"], labels)
     loss_noise = outputs["loss_noise"]
@@ -69,6 +97,13 @@ def total_stage2_single_missing_loss(
 
     loss_align = alignment_loss(outputs["z_h"], outputs["z_l"])
     loss_refine = F.mse_loss(outputs["z_refined_missing"], outputs["z_fused_missing"].detach())
+    zero = outputs["logits_missing"].new_zeros(())
+    if "z_map" in outputs:
+        loss_map_recon = F.l1_loss(outputs["z_map"], outputs["z_target"].detach())
+        loss_map_cos = cosine_gap_loss(outputs["z_map"], outputs["z_target"].detach())
+    else:
+        loss_map_recon = zero
+        loss_map_cos = zero
 
     loss = (
         loss_cls_missing
@@ -76,6 +111,8 @@ def total_stage2_single_missing_loss(
         + lambda_recon * loss_recon
         + lambda_align * loss_align
         + lambda_refine * loss_refine
+        + lambda_map_recon * loss_map_recon
+        + lambda_map_cos * loss_map_cos
     )
 
     return {
@@ -85,4 +122,6 @@ def total_stage2_single_missing_loss(
         "loss_recon": loss_recon,
         "loss_align": loss_align,
         "loss_refine": loss_refine,
+        "loss_map_recon": loss_map_recon,
+        "loss_map_cos": loss_map_cos,
     }

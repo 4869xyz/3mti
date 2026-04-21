@@ -68,6 +68,8 @@ def train_one_epoch(
     lambda_recon: float,
     lambda_align: float,
     lambda_refine: float,
+    lambda_map_recon: float,
+    lambda_map_cos: float,
     logger,
     epoch: int,
     log_batch_interval: int,
@@ -81,6 +83,8 @@ def train_one_epoch(
         "loss_recon": 0.0,
         "loss_align": 0.0,
         "loss_refine": 0.0,
+        "loss_map_recon": 0.0,
+        "loss_map_cos": 0.0,
     }
 
     pbar = tqdm(loader, desc=f"Train-S2-{missing_mode}", leave=False)
@@ -103,6 +107,8 @@ def train_one_epoch(
             lambda_recon=lambda_recon,
             lambda_align=lambda_align,
             lambda_refine=lambda_refine,
+            lambda_map_recon=lambda_map_recon,
+            lambda_map_cos=lambda_map_cos,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -120,11 +126,12 @@ def train_one_epoch(
             cls=f"{scalar_losses['loss_cls_missing']:.4f}",
             noise=f"{scalar_losses['loss_noise']:.4f}",
             recon=f"{scalar_losses['loss_recon']:.4f}",
+            map=f"{scalar_losses['loss_map_recon']:.4f}",
         )
 
         if log_batch_interval > 0 and step % log_batch_interval == 0:
             logger.info(
-                "Epoch %03d Batch %04d | loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f",
+                "Epoch %03d Batch %04d | loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f map_recon=%.6f map_cos=%.6f",
                 epoch,
                 step,
                 scalar_losses["loss"],
@@ -133,6 +140,8 @@ def train_one_epoch(
                 scalar_losses["loss_recon"],
                 scalar_losses["loss_align"],
                 scalar_losses["loss_refine"],
+                scalar_losses["loss_map_recon"],
+                scalar_losses["loss_map_cos"],
             )
 
     if total_samples == 0:
@@ -239,6 +248,7 @@ def build_parser(default_output_dir: Optional[str] = None) -> argparse.ArgumentP
     parser.add_argument("--csm_heads", type=int, default=cfg.csm_heads)
     parser.add_argument("--csm_depth", type=int, default=cfg.csm_depth)
     parser.add_argument("--dropout", type=float, default=cfg.dropout)
+    parser.add_argument("--mapper_num_blocks", type=int, default=cfg.mapper_num_blocks)
 
     parser.add_argument("--diffusion_hidden_dim", type=int, default=cfg.diffusion_hidden_dim)
     parser.add_argument("--diffusion_steps", type=int, default=cfg.diffusion_steps)
@@ -255,6 +265,8 @@ def build_parser(default_output_dir: Optional[str] = None) -> argparse.ArgumentP
     parser.add_argument("--lambda_recon", type=float, default=cfg.lambda_recon)
     parser.add_argument("--lambda_align", type=float, default=cfg.lambda_align)
     parser.add_argument("--lambda_refine", type=float, default=cfg.lambda_refine)
+    parser.add_argument("--lambda_map_recon", type=float, default=cfg.lambda_map_recon)
+    parser.add_argument("--lambda_map_cos", type=float, default=cfg.lambda_map_cos)
 
     parser.add_argument("--eval_start_epoch", type=int, default=cfg.eval_start_epoch)
     parser.add_argument("--eval_interval", type=int, default=cfg.eval_interval)
@@ -333,6 +345,7 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
         diffusion_steps=args.diffusion_steps,
         diffusion_beta_start=args.diffusion_beta_start,
         diffusion_beta_end=args.diffusion_beta_end,
+        mapper_num_blocks=args.mapper_num_blocks,
     ).to(device)
 
     if args.stage1_ckpt:
@@ -376,6 +389,8 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
             lambda_recon=args.lambda_recon,
             lambda_align=args.lambda_align,
             lambda_refine=args.lambda_refine,
+            lambda_map_recon=args.lambda_map_recon,
+            lambda_map_cos=args.lambda_map_cos,
             logger=logger,
             epoch=epoch,
             log_batch_interval=args.log_batch_interval,
@@ -397,7 +412,8 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
             class_ids = meta.get("class_ids", list(range(meta["num_classes"])))
 
             logger.info(
-                "Epoch %03d | train_loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f | "
+                "Epoch %03d | train_loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f "
+                "map_recon=%.6f map_cos=%.6f | "
                 "eval_ce=%.6f OA=%.6f AA=%.6f Kappa=%.6f",
                 epoch,
                 train_loss["loss"],
@@ -406,6 +422,8 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
                 train_loss["loss_recon"],
                 train_loss["loss_align"],
                 train_loss["loss_refine"],
+                train_loss["loss_map_recon"],
+                train_loss["loss_map_cos"],
                 float(metrics["ce_loss"]),
                 oa,
                 aa,
@@ -476,6 +494,7 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
             )
             logger.info(
                 "Epoch %03d | train_loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f "
+                "map_recon=%.6f map_cos=%.6f "
                 "(skip eval, start=%d interval=%d)",
                 epoch,
                 train_loss["loss"],
@@ -484,6 +503,8 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
                 train_loss["loss_recon"],
                 train_loss["loss_align"],
                 train_loss["loss_refine"],
+                train_loss["loss_map_recon"],
+                train_loss["loss_map_cos"],
                 args.eval_start_epoch,
                 args.eval_interval,
             )

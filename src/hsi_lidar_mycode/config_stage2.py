@@ -15,6 +15,7 @@ class Stage2Config:
     csm_heads: int = 4
     csm_depth: int = 2
     dropout: float = 0.3
+    mapper_num_blocks: int = 4
 
     diffusion_hidden_dim: int = 128
     diffusion_steps: int = 60
@@ -32,6 +33,8 @@ class Stage2Config:
     lambda_recon: float = 0.5
     lambda_align: float = 0.05
     lambda_refine: float = 0.2
+    lambda_map_recon: float = 1.0
+    lambda_map_cos: float = 0.5
 
     eval_start_epoch: int = 1
     eval_interval: int = 1
