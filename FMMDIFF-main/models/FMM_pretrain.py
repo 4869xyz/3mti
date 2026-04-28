@@ -19,17 +19,21 @@ class FMM_Pretrain():
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.num_modality = len(cfg.data.modalities_name)
+        #给每个模态创建一个specific encoder+decoder
         self.model_spe_list = [FMM_model(cfg.model.in_channels, cfg.model.down_num) for i in range(self.num_modality)]
+        #给每个模态创建一个 mapping encoder + decoder
         self.model_map_list = [FMM_model(self.num_modality - 1, cfg.model.down_num) for i in range(self.num_modality)]
+        #单独创建specific encoder列表，它主要在训练 mapping encoder 时，用来加载已经训练好的 specific encoder，作为特征对齐目标。
         self.model_spe_enc_list = [Encoder(cfg.model.in_channels, cfg.model.down_num) for i in range(self.num_modality)]
 
     def pretrain(self, specific_encoder=True):
         # pretrain specific and mapping encoder
         for index_model in range(self.num_modality):
+            #取出来当前模态的名字
             name_of_modality = self.cfg.data.modalities_name[index_model].split('.')[0]
 
             if specific_encoder:
-                model = self.model_spe_list[index_model].to(self.device)
+                model = self.model_spe_list[index_model].to(self.device)#取出来取当前模态对应的 specific FMM_model，并放到 GPU/CPU。
                 optim = torch.optim.AdamW(model.parameters(), lr=self.cfg.optim_FMM.lr,
                                           weight_decay=self.cfg.optim_FMM.weight_decay)
                 self.train_spe_loop(model, optim, index_model, name_of_modality)

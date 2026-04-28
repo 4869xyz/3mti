@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import random
-from typing import Dict, Optional
+from typing import Dict
 
 import numpy as np
 import torch
@@ -10,17 +10,17 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 try:
-    from .config_stage3 import Stage3Config
+    from .config_stage2 import Stage2Config
     from .dataset_remote import build_houston_loaders
     from .log_utils import build_logger, format_confusion_matrix, save_confusion_matrix
-    from .losses_stage2 import total_stage3_single_missing_loss
+    from .losses_stage2 import total_stage2_mapper_loss
     from .metrics import compute_classification_metrics
     from .model_stage2 import Stage2HSILiDARMissingModalityClassifier
 except ImportError:
-    from config_stage3 import Stage3Config
+    from config_stage2 import Stage2Config
     from dataset_remote import build_houston_loaders
     from log_utils import build_logger, format_confusion_matrix, save_confusion_matrix
-    from losses_stage2 import total_stage3_single_missing_loss
+    from losses_stage2 import total_stage2_mapper_loss
     from metrics import compute_classification_metrics
     from model_stage2 import Stage2HSILiDARMissingModalityClassifier
 
@@ -51,6 +51,14 @@ def _to_scalar_dict(loss_dict: Dict[str, torch.Tensor]) -> Dict[str, float]:
     return {k: float(v.detach().item()) for k, v in loss_dict.items()}
 
 
+def _mapper_state_dict(model) -> Dict[str, torch.Tensor]:
+    return {
+        k: v.detach().cpu()
+        for k, v in model.state_dict().items()
+        if k.startswith(("map_h_from_l.", "map_l_from_h."))
+    }
+
+
 def _build_optimizer(model, lr: float, weight_decay: float):
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
@@ -63,49 +71,43 @@ def train_one_epoch(
     loader,
     optimizer,
     device,
-    missing_mode: str,
-    lambda_cls_missing: float,
-    lambda_noise: float,
-    lambda_recon: float,
-    lambda_align: float,
-    lambda_refine: float,
+    lambda_cls_mapper: float,
+    lambda_map_recon: float,
+    lambda_map_cos: float,
     logger,
     epoch: int,
     log_batch_interval: int,
 ):
     model.train()
-    model.use_diffusion_compensator_train_mode()
+    model.use_mapper_pretrain_mode()
     total_samples = 0
     meter = {
         "loss": 0.0,
-        "loss_cls_missing": 0.0,
-        "loss_noise": 0.0,
-        "loss_recon": 0.0,
-        "loss_align": 0.0,
-        "loss_refine": 0.0,
+        "loss_cls_mapper": 0.0,
+        "loss_cls_hsi_mapped": 0.0,
+        "loss_cls_lidar_mapped": 0.0,
+        "loss_cls_enhanced": 0.0,
+        "loss_map_recon": 0.0,
+        "loss_map_cos": 0.0,
+        "loss_map_recon_h": 0.0,
+        "loss_map_recon_l": 0.0,
+        "loss_map_cos_h": 0.0,
+        "loss_map_cos_l": 0.0,
     }
 
-    pbar = tqdm(loader, desc=f"Train-S3-{missing_mode}", leave=False)
+    pbar = tqdm(loader, desc="Train-S2-Mapper", leave=False)
     for step, batch in enumerate(pbar, start=1):
         hsi = batch["hsi"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        if missing_mode == "hsi_missing":
-            outputs = model.forward_train_missing_hsi(hsi, lidar)
-        elif missing_mode == "lidar_missing":
-            outputs = model.forward_train_missing_lidar(hsi, lidar)
-        else:
-            raise ValueError(f"Unsupported missing_mode: {missing_mode}")
-
-        losses = total_stage3_single_missing_loss(
+        outputs = model.forward_mapper_only(hsi, lidar)
+        losses = total_stage2_mapper_loss(
             outputs=outputs,
             labels=labels,
-            lambda_cls_missing=lambda_cls_missing,
-            lambda_noise=lambda_noise,
-            lambda_recon=lambda_recon,
-            lambda_align=lambda_align,
-            lambda_refine=lambda_refine,
+            lambda_cls_mapper=lambda_cls_mapper,
+            lambda_map_recon=lambda_map_recon,
+            lambda_map_cos=lambda_map_cos,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -120,23 +122,29 @@ def train_one_epoch(
 
         pbar.set_postfix(
             loss=f"{scalar_losses['loss']:.4f}",
-            cls=f"{scalar_losses['loss_cls_missing']:.4f}",
-            noise=f"{scalar_losses['loss_noise']:.4f}",
-            recon=f"{scalar_losses['loss_recon']:.4f}",
-            refine=f"{scalar_losses['loss_refine']:.4f}",
+            cls=f"{scalar_losses['loss_cls_mapper']:.4f}",
+            recon=f"{scalar_losses['loss_map_recon']:.4f}",
+            cos=f"{scalar_losses['loss_map_cos']:.4f}",
         )
 
         if log_batch_interval > 0 and step % log_batch_interval == 0:
             logger.info(
-                "Epoch %03d Batch %04d | loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f",
+                "Epoch %03d Batch %04d | loss=%.6f cls=%.6f cls_h=%.6f cls_l=%.6f cls_enh=%.6f "
+                "map_recon=%.6f map_cos=%.6f "
+                "recon_h=%.6f recon_l=%.6f cos_h=%.6f cos_l=%.6f",
                 epoch,
                 step,
                 scalar_losses["loss"],
-                scalar_losses["loss_cls_missing"],
-                scalar_losses["loss_noise"],
-                scalar_losses["loss_recon"],
-                scalar_losses["loss_align"],
-                scalar_losses["loss_refine"],
+                scalar_losses["loss_cls_mapper"],
+                scalar_losses["loss_cls_hsi_mapped"],
+                scalar_losses["loss_cls_lidar_mapped"],
+                scalar_losses["loss_cls_enhanced"],
+                scalar_losses["loss_map_recon"],
+                scalar_losses["loss_map_cos"],
+                scalar_losses["loss_map_recon_h"],
+                scalar_losses["loss_map_recon_l"],
+                scalar_losses["loss_map_cos_h"],
+                scalar_losses["loss_map_cos_l"],
             )
 
     if total_samples == 0:
@@ -150,34 +158,47 @@ def evaluate_one_epoch(
     loader,
     device,
     num_classes: int,
-    missing_mode: str,
-    sampling_steps: int,
+    lambda_cls_mapper: float,
+    lambda_map_recon: float,
+    lambda_map_cos: float,
 ):
     model.eval()
     total_samples = 0
-    ce_sum = 0.0
+    meter = {
+        "loss": 0.0,
+        "loss_cls_mapper": 0.0,
+        "loss_cls_hsi_mapped": 0.0,
+        "loss_cls_lidar_mapped": 0.0,
+        "loss_cls_enhanced": 0.0,
+        "loss_map_recon": 0.0,
+        "loss_map_cos": 0.0,
+        "loss_map_recon_h": 0.0,
+        "loss_map_recon_l": 0.0,
+        "loss_map_cos_h": 0.0,
+        "loss_map_cos_l": 0.0,
+    }
     class_loss_sum = np.zeros((num_classes,), dtype=np.float64)
     class_count = np.zeros((num_classes,), dtype=np.int64)
     all_preds = []
     all_labels = []
 
-    pbar = tqdm(loader, desc=f"Eval-S3-{missing_mode}", leave=False)
+    pbar = tqdm(loader, desc="Eval-S2-Mapper", leave=False)
     for batch in pbar:
         hsi = batch["hsi"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        out = model.forward_mode(
-            hsi=hsi,
-            lidar=lidar,
-            mode=missing_mode,
-            sampling_steps=sampling_steps,
+        outputs = model.forward_mapper_only(hsi, lidar)
+        losses = total_stage2_mapper_loss(
+            outputs=outputs,
+            labels=labels,
+            lambda_cls_mapper=lambda_cls_mapper,
+            lambda_map_recon=lambda_map_recon,
+            lambda_map_cos=lambda_map_cos,
         )
-        logits = out["logits"]
-        ce_per_sample = F.cross_entropy(logits, labels, reduction="none")
-        ce_sum += float(ce_per_sample.sum().item())
+        ce_per_sample = F.cross_entropy(outputs["logits"], labels, reduction="none")
 
-        preds = logits.argmax(dim=1)
+        preds = outputs["logits"].argmax(dim=1)
         all_preds.append(preds.detach().cpu())
         all_labels.append(labels.detach().cpu())
 
@@ -186,20 +207,26 @@ def evaluate_one_epoch(
         np.add.at(class_loss_sum, labels_np, ce_np)
         np.add.at(class_count, labels_np, 1)
 
-        total_samples += labels.size(0)
+        bsz = labels.size(0)
+        total_samples += bsz
+        scalar_losses = _to_scalar_dict(losses)
+        for key in meter:
+            meter[key] += scalar_losses[key] * bsz
 
     if total_samples == 0:
-        return {
+        avg_loss = {k: 0.0 for k in meter}
+        metrics = {
             "oa": 0.0,
             "aa": 0.0,
             "kappa": 0.0,
-            "ce_loss": 0.0,
             "per_class_acc": np.zeros((num_classes,), dtype=np.float32),
             "per_class_loss": np.zeros((num_classes,), dtype=np.float32),
             "per_class_count": np.zeros((num_classes,), dtype=np.int64),
             "confusion_matrix": np.zeros((num_classes, num_classes), dtype=np.int64),
         }
+        return avg_loss, metrics
 
+    avg_loss = {k: v / total_samples for k, v in meter.items()}
     y_pred = torch.cat(all_preds, dim=0)
     y_true = torch.cat(all_labels, dim=0)
     metrics = compute_classification_metrics(y_true, y_pred, num_classes=num_classes)
@@ -210,16 +237,16 @@ def evaluate_one_epoch(
         where=class_count > 0,
     )
     per_class_loss = np.where(class_count > 0, per_class_loss, 0.0).astype(np.float32)
-    metrics["ce_loss"] = ce_sum / total_samples
     metrics["per_class_loss"] = per_class_loss
     metrics["per_class_count"] = class_count
-    return metrics
+    return avg_loss, metrics
 
 
 def save_checkpoint(path: str, model, optimizer, epoch: int, best_metrics: Dict[str, float], args) -> None:
     payload = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
+        "mapper_state_dict": _mapper_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
         "best_metrics": best_metrics,
         "args": vars(args),
@@ -227,85 +254,28 @@ def save_checkpoint(path: str, model, optimizer, epoch: int, best_metrics: Dict[
     torch.save(payload, path)
 
 
-def build_parser(default_output_dir: Optional[str] = None) -> argparse.ArgumentParser:
-    cfg = Stage3Config()
-    parser = argparse.ArgumentParser(description="Stage3 diffusion compensator training")
-
-    parser.add_argument("--dataset_name", type=str, default=cfg.dataset_name)
-    parser.add_argument("--data_root", type=str, default=cfg.data_root)
-    parser.add_argument("--patch_size", type=int, default=cfg.patch_size)
-    parser.add_argument("--hsi_pca_dim", type=int, default=cfg.hsi_pca_dim)
-    parser.add_argument("--use_pca", type=str2bool, default=cfg.use_pca)
-    parser.add_argument("--train_per_class", type=int, default=cfg.train_per_class)
-    parser.add_argument("--use_misalign_aug", type=str2bool, default=cfg.use_misalign_aug)
-
-    parser.add_argument("--latent_dim", type=int, default=cfg.latent_dim)
-    parser.add_argument("--csm_heads", type=int, default=cfg.csm_heads)
-    parser.add_argument("--csm_depth", type=int, default=cfg.csm_depth)
-    parser.add_argument("--dropout", type=float, default=cfg.dropout)
-    parser.add_argument("--mapper_num_blocks", type=int, default=cfg.mapper_num_blocks)
-
-    parser.add_argument("--diffusion_hidden_dim", type=int, default=cfg.diffusion_hidden_dim)
-    parser.add_argument("--diffusion_steps", type=int, default=cfg.diffusion_steps)
-    parser.add_argument("--diffusion_beta_start", type=float, default=cfg.diffusion_beta_start)
-    parser.add_argument("--diffusion_beta_end", type=float, default=cfg.diffusion_beta_end)
-    parser.add_argument("--sampling_steps", type=int, default=cfg.sampling_steps)
-
-    parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
-    parser.add_argument("--epochs", type=int, default=cfg.epochs)
-    parser.add_argument("--lr", type=float, default=cfg.lr)
-    parser.add_argument("--weight_decay", type=float, default=cfg.weight_decay)
-
-    parser.add_argument("--lambda_cls_missing", type=float, default=cfg.lambda_cls_missing)
-    parser.add_argument("--lambda_noise", type=float, default=cfg.lambda_noise)
-    parser.add_argument("--lambda_recon", type=float, default=cfg.lambda_recon)
-    parser.add_argument("--lambda_align", type=float, default=cfg.lambda_align)
-    parser.add_argument("--lambda_refine", type=float, default=cfg.lambda_refine)
-
-    parser.add_argument("--eval_start_epoch", type=int, default=cfg.eval_start_epoch)
-    parser.add_argument("--eval_interval", type=int, default=cfg.eval_interval)
-
-    parser.add_argument("--stage1_ckpt", type=str, default=cfg.stage1_ckpt)
-    parser.add_argument("--strict_stage1_load", type=str2bool, default=cfg.strict_stage1_load)
-    parser.add_argument("--stage2_mapper_ckpt", type=str, default=cfg.stage2_mapper_ckpt)
-    parser.add_argument("--strict_stage2_mapper_load", type=str2bool, default=cfg.strict_stage2_mapper_load)
-
-    parser.add_argument("--seed", type=int, default=cfg.seed)
-    parser.add_argument("--num_workers", type=int, default=cfg.num_workers)
-    parser.add_argument("--log_batch_interval", type=int, default=cfg.log_batch_interval)
-    parser.add_argument("--output_dir", type=str, default=default_output_dir or cfg.output_dir)
-    return parser
-
-
-def run_training_for_mode(missing_mode: str, default_output_dir: str, description: str) -> None:
-    if missing_mode not in {"hsi_missing", "lidar_missing"}:
-        raise ValueError(f"Unsupported missing mode: {missing_mode}")
-
-    parser = build_parser(default_output_dir=default_output_dir)
-    args = parser.parse_args()
-
+def main(args):
     if args.dataset_name.lower() != "houston":
         raise NotImplementedError(
-            f"Current Stage3 implementation supports dataset_name='houston' only, got {args.dataset_name}"
+            f"Current Stage2 implementation supports dataset_name='houston' only, got {args.dataset_name}"
         )
+    if not args.stage1_ckpt:
+        raise ValueError("Stage2 mapper pretraining requires --stage1_ckpt.")
+    if not os.path.exists(args.stage1_ckpt):
+        raise FileNotFoundError(f"stage1_ckpt not found: {args.stage1_ckpt}")
     if args.eval_start_epoch < 1:
         raise ValueError(f"eval_start_epoch must be >= 1, got {args.eval_start_epoch}")
     if args.eval_interval < 1:
         raise ValueError(f"eval_interval must be >= 1, got {args.eval_interval}")
-    if not args.stage1_ckpt:
-        raise ValueError("Stage3 diffusion training requires --stage1_ckpt.")
-    if not args.stage2_mapper_ckpt:
-        raise ValueError("Stage3 diffusion training requires --stage2_mapper_ckpt from Stage2 mapper pretraining.")
 
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
     logger = build_logger(
         output_dir=args.output_dir,
         filename="train.log",
-        logger_name=f"stage3_{missing_mode}_{os.path.abspath(args.output_dir)}",
+        logger_name=f"stage2_mapper_{os.path.abspath(args.output_dir)}",
     )
-    logger.info("==== %s ====", description)
-    logger.info("Missing mode: %s", missing_mode)
+    logger.info("==== Stage2 Mapper Pretraining ====")
     logger.info("Args: %s", json.dumps(vars(args), ensure_ascii=False, indent=2))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -338,15 +308,9 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
         csm_heads=args.csm_heads,
         csm_depth=args.csm_depth,
         dropout=args.dropout,
-        diffusion_hidden_dim=args.diffusion_hidden_dim,
-        diffusion_steps=args.diffusion_steps,
-        diffusion_beta_start=args.diffusion_beta_start,
-        diffusion_beta_end=args.diffusion_beta_end,
         mapper_num_blocks=args.mapper_num_blocks,
     ).to(device)
 
-    if not os.path.exists(args.stage1_ckpt):
-        raise FileNotFoundError(f"stage1_ckpt not found: {args.stage1_ckpt}")
     load_info = model.load_stage1_checkpoint(
         checkpoint_path=args.stage1_ckpt,
         strict=args.strict_stage1_load,
@@ -359,22 +323,8 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
         len(load_info["unexpected_keys"]),
     )
 
-    if not os.path.exists(args.stage2_mapper_ckpt):
-        raise FileNotFoundError(f"stage2_mapper_ckpt not found: {args.stage2_mapper_ckpt}")
-    mapper_load_info = model.load_stage2_mapper_checkpoint(
-        checkpoint_path=args.stage2_mapper_ckpt,
-        strict=args.strict_stage2_mapper_load,
-        map_location="cpu",
-    )
-    logger.info(
-        "Stage2 mapper ckpt loaded | loaded=%d missing=%d unexpected=%d",
-        len(mapper_load_info["loaded_keys"]),
-        len(mapper_load_info["missing_keys"]),
-        len(mapper_load_info["unexpected_keys"]),
-    )
-
     model.set_all_trainable(False)
-    model.set_diffusion_compensator_trainable(True)
+    model.set_mapper_trainable(True)
     trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters after freezing: %d", trainable_count)
 
@@ -390,12 +340,9 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
             loader=train_loader,
             optimizer=optimizer,
             device=device,
-            missing_mode=missing_mode,
-            lambda_cls_missing=args.lambda_cls_missing,
-            lambda_noise=args.lambda_noise,
-            lambda_recon=args.lambda_recon,
-            lambda_align=args.lambda_align,
-            lambda_refine=args.lambda_refine,
+            lambda_cls_mapper=args.lambda_cls_mapper,
+            lambda_map_recon=args.lambda_map_recon,
+            lambda_map_cos=args.lambda_map_cos,
             logger=logger,
             epoch=epoch,
             log_batch_interval=args.log_batch_interval,
@@ -403,30 +350,58 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
 
         do_eval = should_evaluate(epoch=epoch, eval_start_epoch=args.eval_start_epoch, eval_interval=args.eval_interval)
         if do_eval:
-            metrics = evaluate_one_epoch(
+            val_loss, val_metrics = evaluate_one_epoch(
                 model=model,
                 loader=test_loader,
                 device=device,
                 num_classes=meta["num_classes"],
-                missing_mode=missing_mode,
-                sampling_steps=args.sampling_steps,
+                lambda_cls_mapper=args.lambda_cls_mapper,
+                lambda_map_recon=args.lambda_map_recon,
+                lambda_map_cos=args.lambda_map_cos,
             )
-            oa = float(metrics["oa"])
-            aa = float(metrics["aa"])
-            kappa = float(metrics["kappa"])
+            oa = float(val_metrics["oa"])
+            aa = float(val_metrics["aa"])
+            kappa = float(val_metrics["kappa"])
             class_ids = meta.get("class_ids", list(range(meta["num_classes"])))
 
+            history.append(
+                {
+                    "epoch": epoch,
+                    "evaluated": True,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_metrics": {
+                        "oa": oa,
+                        "aa": aa,
+                        "kappa": kappa,
+                        "per_class_acc": val_metrics["per_class_acc"].tolist(),
+                        "per_class_loss": val_metrics["per_class_loss"].tolist(),
+                        "per_class_count": val_metrics["per_class_count"].tolist(),
+                    },
+                }
+            )
+
             logger.info(
-                "Epoch %03d | train_loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f | "
-                "eval_ce=%.6f OA=%.6f AA=%.6f Kappa=%.6f",
+                "Epoch %03d | train_loss=%.6f cls=%.6f cls_h=%.6f cls_l=%.6f cls_enh=%.6f "
+                "map_recon=%.6f map_cos=%.6f | "
+                "val_loss=%.6f val_cls=%.6f val_cls_h=%.6f val_cls_l=%.6f val_cls_enh=%.6f "
+                "val_map_recon=%.6f val_map_cos=%.6f | "
+                "OA=%.6f AA=%.6f Kappa=%.6f",
                 epoch,
                 train_loss["loss"],
-                train_loss["loss_cls_missing"],
-                train_loss["loss_noise"],
-                train_loss["loss_recon"],
-                train_loss["loss_align"],
-                train_loss["loss_refine"],
-                float(metrics["ce_loss"]),
+                train_loss["loss_cls_mapper"],
+                train_loss["loss_cls_hsi_mapped"],
+                train_loss["loss_cls_lidar_mapped"],
+                train_loss["loss_cls_enhanced"],
+                train_loss["loss_map_recon"],
+                train_loss["loss_map_cos"],
+                val_loss["loss"],
+                val_loss["loss_cls_mapper"],
+                val_loss["loss_cls_hsi_mapped"],
+                val_loss["loss_cls_lidar_mapped"],
+                val_loss["loss_cls_enhanced"],
+                val_loss["loss_map_recon"],
+                val_loss["loss_map_cos"],
                 oa,
                 aa,
                 kappa,
@@ -438,33 +413,17 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
                     "  %02d | %3s | %7d | %.6f | %.6f",
                     cls_idx,
                     str(orig_label),
-                    int(metrics["per_class_count"][cls_idx]),
-                    float(metrics["per_class_acc"][cls_idx]),
-                    float(metrics["per_class_loss"][cls_idx]),
+                    int(val_metrics["per_class_count"][cls_idx]),
+                    float(val_metrics["per_class_acc"][cls_idx]),
+                    float(val_metrics["per_class_loss"][cls_idx]),
                 )
 
-            logger.info("Confusion matrix (epoch %03d):\n%s", epoch, format_confusion_matrix(metrics["confusion_matrix"]))
+            conf_mat = val_metrics["confusion_matrix"]
+            logger.info("Confusion matrix (epoch %03d):\n%s", epoch, format_confusion_matrix(conf_mat))
             save_confusion_matrix(
-                conf_mat=metrics["confusion_matrix"],
+                conf_mat=conf_mat,
                 save_dir=confusion_dir,
-                tag=f"epoch_{epoch:03d}_{missing_mode}",
-            )
-
-            history.append(
-                {
-                    "epoch": epoch,
-                    "evaluated": True,
-                    "train_loss": train_loss,
-                    "eval_metrics": {
-                        "oa": oa,
-                        "aa": aa,
-                        "kappa": kappa,
-                        "ce_loss": float(metrics["ce_loss"]),
-                        "per_class_acc": metrics["per_class_acc"].tolist(),
-                        "per_class_loss": metrics["per_class_loss"].tolist(),
-                        "per_class_count": metrics["per_class_count"].tolist(),
-                    },
-                }
+                tag=f"epoch_{epoch:03d}_stage2_mapper",
             )
 
             is_better = (oa > best_oa) or (abs(oa - best_oa) < 1e-12 and kappa > best_kappa)
@@ -480,30 +439,33 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
                     args=args,
                 )
                 save_confusion_matrix(
-                    conf_mat=metrics["confusion_matrix"],
+                    conf_mat=conf_mat,
                     save_dir=confusion_dir,
-                    tag=f"best_{missing_mode}",
+                    tag="best_stage2_mapper",
                 )
-                logger.info("New best checkpoint at epoch %03d | OA=%.6f Kappa=%.6f", epoch, best_oa, best_kappa)
+                logger.info("New best mapper checkpoint at epoch %03d | OA=%.6f Kappa=%.6f", epoch, best_oa, best_kappa)
         else:
             history.append(
                 {
                     "epoch": epoch,
                     "evaluated": False,
                     "train_loss": train_loss,
-                    "eval_metrics": None,
+                    "val_loss": None,
+                    "val_metrics": None,
                 }
             )
             logger.info(
-                "Epoch %03d | train_loss=%.6f cls=%.6f noise=%.6f recon=%.6f align=%.6f refine=%.6f "
+                "Epoch %03d | train_loss=%.6f cls=%.6f cls_h=%.6f cls_l=%.6f cls_enh=%.6f "
+                "map_recon=%.6f map_cos=%.6f "
                 "(skip eval, start=%d interval=%d)",
                 epoch,
                 train_loss["loss"],
-                train_loss["loss_cls_missing"],
-                train_loss["loss_noise"],
-                train_loss["loss_recon"],
-                train_loss["loss_align"],
-                train_loss["loss_refine"],
+                train_loss["loss_cls_mapper"],
+                train_loss["loss_cls_hsi_mapped"],
+                train_loss["loss_cls_lidar_mapped"],
+                train_loss["loss_cls_enhanced"],
+                train_loss["loss_map_recon"],
+                train_loss["loss_map_cos"],
                 args.eval_start_epoch,
                 args.eval_interval,
             )
@@ -527,3 +489,49 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
         logger.info("No evaluation executed. Please check eval_start_epoch/eval_interval.")
     else:
         logger.info("Best OA=%.6f Best Kappa=%.6f", best_oa, best_kappa)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    cfg = Stage2Config()
+    parser = argparse.ArgumentParser(description="Stage2 DirectionalFeatureMapper pretraining")
+
+    parser.add_argument("--dataset_name", type=str, default=cfg.dataset_name)
+    parser.add_argument("--data_root", type=str, default=cfg.data_root)
+    parser.add_argument("--patch_size", type=int, default=cfg.patch_size)
+    parser.add_argument("--hsi_pca_dim", type=int, default=cfg.hsi_pca_dim)
+    parser.add_argument("--use_pca", type=str2bool, default=cfg.use_pca)
+    parser.add_argument("--train_per_class", type=int, default=cfg.train_per_class)
+    parser.add_argument("--use_misalign_aug", type=str2bool, default=cfg.use_misalign_aug)
+
+    parser.add_argument("--latent_dim", type=int, default=cfg.latent_dim)
+    parser.add_argument("--csm_heads", type=int, default=cfg.csm_heads)
+    parser.add_argument("--csm_depth", type=int, default=cfg.csm_depth)
+    parser.add_argument("--dropout", type=float, default=cfg.dropout)
+    parser.add_argument("--mapper_num_blocks", type=int, default=cfg.mapper_num_blocks)
+
+    parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
+    parser.add_argument("--epochs", type=int, default=cfg.epochs)
+    parser.add_argument("--lr", type=float, default=cfg.lr)
+    parser.add_argument("--weight_decay", type=float, default=cfg.weight_decay)
+
+    parser.add_argument("--lambda_cls_mapper", type=float, default=cfg.lambda_cls_mapper)
+    parser.add_argument("--lambda_map_recon", type=float, default=cfg.lambda_map_recon)
+    parser.add_argument("--lambda_map_cos", type=float, default=cfg.lambda_map_cos)
+
+    parser.add_argument("--eval_start_epoch", type=int, default=cfg.eval_start_epoch)
+    parser.add_argument("--eval_interval", type=int, default=cfg.eval_interval)
+
+    parser.add_argument("--stage1_ckpt", type=str, default=cfg.stage1_ckpt)
+    parser.add_argument("--strict_stage1_load", type=str2bool, default=cfg.strict_stage1_load)
+
+    parser.add_argument("--seed", type=int, default=cfg.seed)
+    parser.add_argument("--num_workers", type=int, default=cfg.num_workers)
+    parser.add_argument("--log_batch_interval", type=int, default=cfg.log_batch_interval)
+    parser.add_argument("--output_dir", type=str, default=cfg.output_dir)
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    cli_args = parser.parse_args()
+    main(cli_args)

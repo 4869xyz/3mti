@@ -89,6 +89,48 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             for param in module.parameters():
                 param.requires_grad = trainable
 
+    def set_all_trainable(self, trainable: bool) -> None:
+        for param in self.parameters():
+            param.requires_grad = trainable
+
+    def set_mapper_trainable(self, trainable: bool) -> None:
+        for module in [self.map_h_from_l, self.map_l_from_h]:
+            for param in module.parameters():
+                param.requires_grad = trainable
+
+    def set_diffusion_compensator_trainable(self, trainable: bool) -> None:
+        for module in [self.lidar_to_hsi, self.hsi_to_lidar]:
+            for param in module.parameters():
+                param.requires_grad = trainable
+
+    def use_mapper_pretrain_mode(self) -> None:
+        for module in [
+            self.hsi_encoder,
+            self.lidar_encoder,
+            self.csm,
+            self.diff_refiner,
+            self.classifier,
+            self.lidar_to_hsi,
+            self.hsi_to_lidar,
+        ]:
+            module.eval()
+        self.map_h_from_l.train()
+        self.map_l_from_h.train()
+
+    def use_diffusion_compensator_train_mode(self) -> None:
+        for module in [
+            self.hsi_encoder,
+            self.lidar_encoder,
+            self.csm,
+            self.diff_refiner,
+            self.classifier,
+            self.map_h_from_l,
+            self.map_l_from_h,
+        ]:
+            module.eval()
+        self.lidar_to_hsi.train()
+        self.hsi_to_lidar.train()
+
     def load_stage1_checkpoint(
         self,
         checkpoint_path: str,
@@ -114,6 +156,55 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             "missing_keys": list(load_info.missing_keys),
             "ignored_missing_keys": ignored_missing,
             "unexpected_keys": unexpected,
+        }
+
+    def load_stage2_mapper_checkpoint(
+        self,
+        checkpoint_path: str,
+        strict: bool = True,
+        map_location: str = "cpu",
+    ) -> Dict[str, object]:
+        ckpt = torch.load(checkpoint_path, map_location=map_location)
+        state_dict = ckpt.get("mapper_state_dict")
+        if state_dict is None:
+            full_state = ckpt.get("model_state_dict", ckpt)
+            mapper_prefixes = ("map_h_from_l.", "map_l_from_h.")
+            state_dict = {k: v for k, v in full_state.items() if k.startswith(mapper_prefixes)}
+
+        if not state_dict:
+            raise RuntimeError(f"No mapper weights found in checkpoint: {checkpoint_path}")
+
+        own_state = self.state_dict()
+        missing_keys = []
+        unexpected_keys = []
+        loaded_keys = []
+
+        with torch.no_grad():
+            for key, value in state_dict.items():
+                if key not in own_state:
+                    unexpected_keys.append(key)
+                    continue
+                if own_state[key].shape != value.shape:
+                    raise RuntimeError(
+                        f"Shape mismatch for {key}: checkpoint={tuple(value.shape)} model={tuple(own_state[key].shape)}"
+                    )
+                own_state[key].copy_(value)
+                loaded_keys.append(key)
+
+        expected_keys = [k for k in own_state if k.startswith(("map_h_from_l.", "map_l_from_h."))]
+        loaded_set = set(loaded_keys)
+        missing_keys = [k for k in expected_keys if k not in loaded_set]
+
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                "Strict stage2 mapper loading failed. "
+                f"missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
+            )
+
+        return {
+            "loaded_keys": loaded_keys,
+            "missing_keys": missing_keys,
+            "unexpected_keys": unexpected_keys,
         }
 
     def _classify_from_latents(self, z_h: torch.Tensor, z_l: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -150,7 +241,10 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
         z_h = encoded["z_h"]
         z_l = encoded["z_l"]
         maps = self.build_enhanced_latents(z_h, z_l)
-        out = self._classify_from_latents(maps["z_h_enh"], maps["z_l_enh"])
+        out_hsi_mapped = self._classify_from_latents(maps["z_h_map"], z_l)
+        out_lidar_mapped = self._classify_from_latents(z_h, maps["z_l_map"])
+        out_enhanced = self._classify_from_latents(maps["z_h_enh"], maps["z_l_enh"])
+        logits = (out_hsi_mapped["logits"] + out_lidar_mapped["logits"] + out_enhanced["logits"]) / 3.0
         return {
             "z_h": z_h,
             "z_l": z_l,
@@ -158,11 +252,14 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             "z_l_map": maps["z_l_map"],
             "z_h_enh": maps["z_h_enh"],
             "z_l_enh": maps["z_l_enh"],
-            "logits": out["logits"],
-            "z_fused": out["z_fused"],
-            "z_refined": out["z_refined"],
-            "aux": out["aux"],
-            "diff_aux": out["diff_aux"],
+            "logits": logits,
+            "logits_hsi_mapped": out_hsi_mapped["logits"],
+            "logits_lidar_mapped": out_lidar_mapped["logits"],
+            "logits_enhanced": out_enhanced["logits"],
+            "z_fused": out_enhanced["z_fused"],
+            "z_refined": out_enhanced["z_refined"],
+            "aux": out_enhanced["aux"],
+            "diff_aux": out_enhanced["diff_aux"],
         }
 
     def forward_train_missing_hsi(self, hsi: torch.Tensor, lidar: torch.Tensor) -> Dict[str, torch.Tensor]:
