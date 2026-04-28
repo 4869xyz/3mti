@@ -4,7 +4,7 @@
 @dataclass
 class Stage1Config:
     dataset_name: str = "houston"
-    data_root: str = "data"
+    data_root: str = "/root/autodl-tmp"
     patch_size: int = 11
     hsi_pca_dim: int = 30
     use_pca: bool = True

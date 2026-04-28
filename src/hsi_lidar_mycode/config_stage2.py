@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Stage2Config:
     dataset_name: str = "houston"
-    data_root: str = "data"
+    data_root: str = "/root/autodl-tmp"
     patch_size: int = 11
     hsi_pca_dim: int = 30
     use_pca: bool = True
@@ -29,7 +29,7 @@ class Stage2Config:
     eval_start_epoch: int = 1
     eval_interval: int = 1
 
-    stage1_ckpt: str = ""
+    stage1_ckpt: str = "/root/3MTI-main-old/outputs/stage1_houston/best.pt"
     strict_stage1_load: bool = False
 
     seed: int = 42
