@@ -5,14 +5,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+#分组数，从大往小尝试，每个分组更细的话，归一化更加灵活
 def _pick_group_count(num_channels: int, max_groups: int = 8) -> int:
     for groups in range(min(max_groups, num_channels), 0, -1):
         if num_channels % groups == 0:
             return groups
     return 1
 
-
+#时间步编码模块，就是把比如t=37，编码为一个更加适合神经网络处理的向量
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, emb_dim: int) -> None:
         super().__init__()
@@ -21,7 +21,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         self.emb_dim = emb_dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        if t.ndim != 1:
+        if t.ndim != 1:#要求必须输入是一维的[B]
             raise ValueError(f"Expected 1D timesteps, got shape {tuple(t.shape)}")
 
         half_dim = self.emb_dim // 2
@@ -37,7 +37,7 @@ class SinusoidalTimeEmbedding(nn.Module):
             emb = F.pad(emb, (0, 1))
         return emb
 
-
+#残差块
 class ResidualConvBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -54,20 +54,21 @@ class ResidualConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(x + self.block(x))
 
-
+#条件噪声预测器
 class ConditionalNoisePredictor(nn.Module):
     def __init__(
         self,
         latent_dim: int,
         hidden_dim: int,
-        timestep_embed_dim: int,
-        max_timestep: int,
+        timestep_embed_dim: int,#时间步嵌入向量的维度
+        max_timestep: int,#最大时间步
     ) -> None:
         super().__init__()
         self.max_timestep = max(max_timestep, 1)
 
-        in_channels = latent_dim * 2 + 1
+        in_channels = latent_dim * 2 + 1#计算 stem 输入层的通道数。因为会将 x_t（噪声图）、condition（条件图）和时间步映射 t_map 在通道维度拼接
         groups = _pick_group_count(hidden_dim)
+        #定义输入处理模块
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(groups, hidden_dim),
@@ -84,6 +85,7 @@ class ConditionalNoisePredictor(nn.Module):
             ResidualConvBlock(hidden_dim),
             ResidualConvBlock(hidden_dim),
         )
+        #输出层，降通道映射回去latent-dim通道，输出x_t形状相同的噪声预测图
         self.head = nn.Conv2d(hidden_dim, latent_dim, kernel_size=3, padding=1)
 
     def forward(self, x_t: torch.Tensor, condition: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
@@ -113,7 +115,7 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
         self,
         latent_dim: int = 128,
         hidden_dim: int = 128,
-        diffusion_steps: int = 100,
+        diffusion_steps: int = 100,#时间步
         beta_start: float = 1e-4,
         beta_end: float = 2e-2,
         timestep_embed_dim: int = 128,
@@ -130,7 +132,7 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
         self.latent_dim = latent_dim
         self.diffusion_steps = diffusion_steps
         self.clip_x0 = clip_x0
-
+        #噪声预测器
         self.noise_predictor = ConditionalNoisePredictor(
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
@@ -151,11 +153,13 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
         out = values.index_select(0, timesteps).view(-1, 1, 1, 1)
         return out.to(dtype=x.dtype, device=x.device)
 
+    #前向扩散过程，给定干净的残差x0，噪声noise，时间步t，计算带噪声的残差
     def q_sample(self, x0: torch.Tensor, timesteps: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         sqrt_ab = self._extract(self.sqrt_alpha_bars, timesteps, x0)
         sqrt_omb = self._extract(self.sqrt_one_minus_alpha_bars, timesteps, x0)
         return sqrt_ab * x0 + sqrt_omb * noise
 
+    #从预测的噪声和当前带噪声的残差反推预测的干净残差
     def predict_x0_from_eps(self, x_t: torch.Tensor, timesteps: torch.Tensor, eps_pred: torch.Tensor) -> torch.Tensor:
         sqrt_ab = self._extract(self.sqrt_alpha_bars, timesteps, x_t)
         sqrt_omb = self._extract(self.sqrt_one_minus_alpha_bars, timesteps, x_t)
@@ -164,14 +168,15 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
 
     def training_forward(
         self,
-        target: torch.Tensor,
-        condition: torch.Tensor,
-        init_latent: Optional[torch.Tensor] = None,
+        target: torch.Tensor,#真实目标图像
+        condition: torch.Tensor,#条件图像
+        init_latent: Optional[torch.Tensor] = None,#初始估计
     ) -> Dict[str, torch.Tensor]:
         if target.shape != condition.shape:
             raise ValueError(f"target/condition shape mismatch: {tuple(target.shape)} vs {tuple(condition.shape)}")
         if target.ndim != 4:
             raise ValueError(f"Expected 4D tensors [B,C,H,W], got {tuple(target.shape)}")
+        #初始化init-latent张量或者检查形状匹配
         if init_latent is None:
             init_latent = torch.zeros_like(target)
         elif init_latent.shape != target.shape:
@@ -179,15 +184,17 @@ class FeatureConditionalDiffusionCompensator(nn.Module):
                 f"init_latent shape mismatch: {tuple(init_latent.shape)} vs target={tuple(target.shape)}"
             )
 
-        # Residual diffusion: r0 = target - coarse mapper output.
+        # Residual diffusion: r0 = target - coarse mapper output.这个是要建模的残差
         target_residual = target - init_latent
 
         bsz = target_residual.shape[0]
         timesteps = torch.randint(0, self.diffusion_steps, (bsz,), device=target.device, dtype=torch.long)
         noise = torch.randn_like(target_residual)
-        x_t = self.q_sample(target_residual, timesteps, noise)
-        eps_pred = self.noise_predictor(x_t, condition, timesteps)
-        loss_noise = F.mse_loss(eps_pred, noise)
+        x_t = self.q_sample(target_residual, timesteps, noise)#随机采样时间步和噪声，加噪得到x-t
+
+
+        eps_pred = self.noise_predictor(x_t, condition, timesteps)#噪声预测器预测噪声
+        loss_noise = F.mse_loss(eps_pred, noise)#计算mse损失
 
         residual_pred = self.predict_x0_from_eps(x_t, timesteps, eps_pred)
         if self.clip_x0 is not None:

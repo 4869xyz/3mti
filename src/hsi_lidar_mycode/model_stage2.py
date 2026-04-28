@@ -50,6 +50,7 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(latent_dim, num_classes),
         )
+        #特征映射器，从hsi到lidar
         self.map_h_from_l = DirectionalFeatureMapper(
             latent_dim=latent_dim,
             num_blocks=mapper_num_blocks,
@@ -60,7 +61,7 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             num_blocks=mapper_num_blocks,
             dropout=dropout,
         )
-
+        #特征补偿器
         self.lidar_to_hsi = FeatureConditionalDiffusionCompensator(
             latent_dim=latent_dim,
             hidden_dim=diffusion_hidden_dim,
@@ -133,9 +134,9 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
         return {"z_h": z_h, "z_l": z_l}
 
     def build_enhanced_latents(self, z_h: torch.Tensor, z_l: torch.Tensor) -> Dict[str, torch.Tensor]:
-        z_h_map = self.map_h_from_l(z_l)
+        z_h_map = self.map_h_from_l(z_l)#用lidar得到朝hsi方向映射的特征
         z_l_map = self.map_l_from_h(z_h)
-        z_h_enh = z_h + z_h_map
+        z_h_enh = z_h + z_h_map#进行残差增强，原始+lidar得到的
         z_l_enh = z_l + z_l_map
         return {
             "z_h_map": z_h_map,

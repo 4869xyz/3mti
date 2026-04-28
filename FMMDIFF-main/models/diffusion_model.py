@@ -212,7 +212,10 @@ class AttnBlock(nn.Module):
 
 
 class Diff_Encoder(nn.Module):
-    def __init__(self, in_channels, num_down, emb_channels=64, base_ch=64,
+    def __init__(self, in_channels, 
+                 num_down,#下采样层数
+                 emb_channels=64, #时间步嵌入维度
+                 base_ch=64,#基础通道数
                  dropout=0.0,
                  use_conv=True,
                  use_scale_shift_norm=True,
@@ -221,17 +224,17 @@ class Diff_Encoder(nn.Module):
         assert num_down >= 1, "num_down must be >= 1"
 
         self.num_down = num_down
-        self.deconv = DoubleConv(in_channels, 64)
+        self.deconv = DoubleConv(in_channels, 64)#两层卷积把输入x提取成为64通道特征
 
 
-        chs = [base_ch * (2 ** i) for i in range(0, num_down)]
-        chs = [chs[i] if i < 2 else chs[i - 1] for i in range(len(chs))]
+        chs = [base_ch * (2 ** i) for i in range(0, num_down)]#生成每一层的通道数[64, 128, 256, 512]
+        chs = [chs[i] if i < 2 else chs[i - 1] for i in range(len(chs))]#限制后面层的通道数不要继续翻倍，[64, 128, 128, 256]
         self.out_channels_per_level = chs
 
-        self.down_blocks = nn.ModuleList()
-        self.res_blocks = nn.ModuleList()
+        self.down_blocks = nn.ModuleList()#负责下采样
+        self.res_blocks = nn.ModuleList()#负责残差特征提取
 
-        self.attnBlock = AttnBlock(chs[-2])
+        self.attnBlock = AttnBlock(chs[-2])#这个其实没有用
 
         for i in range(num_down - 1):
             in_ch = chs[i]
@@ -253,9 +256,9 @@ class Diff_Encoder(nn.Module):
 
 
     def forward(self, x, emb, inter_feat):
-        feats = []
+        feats = []#列表用来保存每一层的encoder特征
         x = self.deconv(x)
-        feats.append(x)
+        feats.append(x)#存第一层特征
         for i in range(len(self.down_blocks)):
             x = self.down_blocks[i](x)
             if i == len(self.down_blocks) - 2:
@@ -264,10 +267,25 @@ class Diff_Encoder(nn.Module):
 
             feats.append(x)
 
-        return feats
+        return feats#返回所有尺度的encoder特征
 
 
 class Diff_Decoder(nn.Module):
+    '''
+    最深层特征 feats[-1]
+        ↓
+    上采样 + skip connection
+        ↓
+    加入条件特征 inter_feats
+        ↓
+    ResBlock + 时间步 embedding
+        ↓
+    继续上采样
+        ↓
+    1×1 卷积
+        ↓
+    输出预测噪声
+    '''
     def __init__(
             self,
             chs,
@@ -280,20 +298,17 @@ class Diff_Decoder(nn.Module):
     ):
         super().__init__()
         self.num_levels = len(chs)
-        self.up_blocks = nn.ModuleList()
-        self.res_blocks = nn.ModuleList()
-        self.level_to_res_idx = {}
-
-
+        self.up_blocks = nn.ModuleList()#负责上采样
+        self.res_blocks = nn.ModuleList()#采样后的特征refine
 
         for i in range(self.num_levels - 1, 0, -1):
-            dec_ch = chs[i] 
-            skip_ch = chs[i - 1]  
-
+            dec_ch = chs[i] #输入通道数
+            skip_ch = chs[i - 1]  #对应的跳跃连接的通道数
+            #上采样部分
             self.up_blocks.append(
                 Upsample(in_channels=dec_ch, out_channels=skip_ch)
             )
-
+            #带时间步嵌入的残差块
             self.res_blocks.append(
                 Diff_ResnetBlock(
                     channels=skip_ch,
@@ -310,11 +325,11 @@ class Diff_Decoder(nn.Module):
         self.final_upsample = nn.Conv2d(chs[0], out_channels, kernel_size=1)
 
     def forward(self, feats, emb, inter_feats):
-        y = feats[-1] 
+        y = feats[-1] #取encoder最深层的特征作为decoder的起点
 
         for k, i in enumerate(range(self.num_levels - 1, 0, -1)):
-            skip = feats[i - 1]
-            y = self.up_blocks[k](y) + skip
+            skip = feats[i - 1]#取encoder对应层的跳跃连接特征
+            y = self.up_blocks[k](y) + skip#上采样再和encoder的同尺度相加
             if k == 0:
                 y = y+ inter_feats
 
@@ -327,44 +342,46 @@ class Diff_Decoder(nn.Module):
 class FMM_Diff(nn.Module):
     def __init__(self, cfg,n_channels=1, n_classes=1):
         super().__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
+        self.n_channels = n_channels#输入通道
+        self.n_classes = n_classes#输出类别数
         self.ch = cfg.model.t_emb
 
         self.cfg = cfg
 
-        self.num_modality = len(cfg.data.modalities_name)
+        self.num_modality = len(cfg.data.modalities_name)#比如有Flair，T1，T2的话，就是三个
+        #创建多个specific encoder，提取模态自己的特征
         self.model_spe_list = nn.ModuleList(
             [Encoder(cfg.model.in_channels, cfg.model.down_num) for _ in range(self.num_modality)]
         )
+        #创建多个mapping encoder，输入是除当前模态外的其他模态
         self.model_map_list = nn.ModuleList(
             [Encoder(self.num_modality - 1, cfg.model.down_num) for _ in range(self.num_modality)]
         )
 
-        self.temb = nn.Module()
-        self.temb.dense = nn.ModuleList([
+        self.temb = nn.Module()#创建时间步embedding容器
+        self.temb.dense = nn.ModuleList([#两层全连接用来进一步处理时间步
             torch.nn.Linear(self.ch,
                             self.ch),
             torch.nn.Linear(self.ch,
                             self.ch),
         ])
-
+        #创建diffusion的encoder，处理带噪的目标图像
         self.diff_encoder = Diff_Encoder(cfg.model.in_channels, cfg.model.down_num, emb_channels=cfg.model.t_emb,
                                          base_ch=cfg.model.base_ch)
 
-        feats_ch = self.diff_encoder.out_channels_per_level
-
+        feats_ch = self.diff_encoder.out_channels_per_level#拿到diffusionencoder的每一层的通道数
+        #encoder特征恢复微输出图像大小
         self.diff_decoder = Diff_Decoder(chs=feats_ch, out_channels=1, emb_channels=cfg.model.t_emb)
-
+        #给每个模态创建一个attention模块
         self.att_list = nn.ModuleList(
             [AttnBlock(feats_ch[-1]) for _ in range(self.num_modality)]
         )
-
+        #创建1*1卷积，把模态拼接后的特征压缩回去统一的通道数
         self.con_list = nn.ModuleList(
             [torch.nn.Conv2d(feats_ch[-1] * (self.num_modality - 1), feats_ch[-1], kernel_size=1, stride=1, padding=0)
              for _ in range(self.num_modality)]
         )
-
+        #作用是让 noisy image 的深层特征 feats[-1] 去融合条件特征 b_feat。
         self.attn_MSFM = AttnBlock(feats_ch[-1])
 
         self.Res_list = nn.ModuleList([
