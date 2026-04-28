@@ -380,6 +380,7 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
 
     optimizer = _build_optimizer(model=model, lr=args.lr, weight_decay=args.weight_decay)
     best_oa = -1.0
+    best_aa = -1.0
     best_kappa = -1.0
     history = []
     confusion_dir = os.path.join(args.output_dir, "confusion_matrices")
@@ -470,13 +471,14 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
             is_better = (oa > best_oa) or (abs(oa - best_oa) < 1e-12 and kappa > best_kappa)
             if is_better:
                 best_oa = oa
+                best_aa = aa
                 best_kappa = kappa
                 save_checkpoint(
                     path=os.path.join(args.output_dir, "best.pt"),
                     model=model,
                     optimizer=optimizer,
                     epoch=epoch,
-                    best_metrics={"oa": best_oa, "kappa": best_kappa},
+                    best_metrics={"oa": best_oa, "aa": best_aa, "kappa": best_kappa},
                     args=args,
                 )
                 save_confusion_matrix(
@@ -484,7 +486,13 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
                     save_dir=confusion_dir,
                     tag=f"best_{missing_mode}",
                 )
-                logger.info("New best checkpoint at epoch %03d | OA=%.6f Kappa=%.6f", epoch, best_oa, best_kappa)
+                logger.info(
+                    "New best checkpoint at epoch %03d | OA=%.6f AA=%.6f Kappa=%.6f",
+                    epoch,
+                    best_oa,
+                    best_aa,
+                    best_kappa,
+                )
         else:
             history.append(
                 {
@@ -513,7 +521,7 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
             model=model,
             optimizer=optimizer,
             epoch=epoch,
-            best_metrics={"oa": best_oa, "kappa": best_kappa},
+            best_metrics={"oa": best_oa, "aa": best_aa, "kappa": best_kappa},
             args=args,
         )
 
@@ -526,4 +534,4 @@ def run_training_for_mode(missing_mode: str, default_output_dir: str, descriptio
     if best_oa < 0:
         logger.info("No evaluation executed. Please check eval_start_epoch/eval_interval.")
     else:
-        logger.info("Best OA=%.6f Best Kappa=%.6f", best_oa, best_kappa)
+        logger.info("Best OA=%.6f Best AA=%.6f Best Kappa=%.6f", best_oa, best_aa, best_kappa)
