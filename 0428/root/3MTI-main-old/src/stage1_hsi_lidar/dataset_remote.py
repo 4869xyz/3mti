@@ -1,4 +1,4 @@
-﻿import os
+import os
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -90,6 +90,7 @@ def load_houston_dataset(data_root: str = "data") -> Tuple[np.ndarray, np.ndarra
         raise ValueError(f"HSI and label map spatial size mismatch: {hsi.shape[:2]} vs {label_map.shape[:2]}")
 
     return hsi, lidar, label_map
+
 
 def standardize_hsi(hsi: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     h, w, c = hsi.shape
@@ -183,7 +184,7 @@ def split_fixed_train_test(
 
     return train_indices, test_indices, class_ids
 
-#把拉平的一维索引重新变成二维图的坐标
+
 def flat_indices_to_coords(flat_indices: np.ndarray, width: int) -> np.ndarray:
     rows = flat_indices // width
     cols = flat_indices % width
@@ -226,7 +227,7 @@ class RemoteSensingDualModalDataset(Dataset):
             raise ValueError(f"HSI shape mismatch with labels: {self.hsi_data.shape[:2]} vs {(h, w)}")
         if self.lidar_data.shape[:2] != (h, w):
             raise ValueError(f"LiDAR shape mismatch with labels: {self.lidar_data.shape[:2]} vs {(h, w)}")
-        #给hsi做边界填充
+
         self.hsi_padded = np.pad(
             self.hsi_data,
             ((self.pad, self.pad), (self.pad, self.pad), (0, 0)),
@@ -242,7 +243,7 @@ class RemoteSensingDualModalDataset(Dataset):
         return int(self.coords.shape[0])
 
     def __getitem__(self, idx: int):
-        row, col = self.coords[idx].tolist()#这里面存的一个二位坐标
+        row, col = self.coords[idx].tolist()
         row = int(row)
         col = int(col)
 
@@ -253,7 +254,7 @@ class RemoteSensingDualModalDataset(Dataset):
             row_p - self.pad : row_p + self.pad + 1,
             col_p - self.pad : col_p + self.pad + 1,
             :,
-        ]#得到[11,11,C]
+        ]
         lidar_patch = self.lidar_padded[
             row_p - self.pad : row_p + self.pad + 1,
             col_p - self.pad : col_p + self.pad + 1,
