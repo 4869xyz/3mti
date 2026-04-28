@@ -494,6 +494,9 @@ def main(args):
 def build_parser() -> argparse.ArgumentParser:
     cfg = Stage2Config()
     parser = argparse.ArgumentParser(description="Stage2 DirectionalFeatureMapper pretraining")
+    lambda_cls_mapper = getattr(cfg, "lambda_cls_mapper", 1.0)
+    lambda_map_recon = getattr(cfg, "lambda_map_recon", 1.0)
+    lambda_map_cos = getattr(cfg, "lambda_map_cos", 0.5)
 
     parser.add_argument("--dataset_name", type=str, default=cfg.dataset_name)
     parser.add_argument("--data_root", type=str, default=cfg.data_root)
@@ -514,9 +517,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=cfg.lr)
     parser.add_argument("--weight_decay", type=float, default=cfg.weight_decay)
 
-    parser.add_argument("--lambda_cls_mapper", type=float, default=cfg.lambda_cls_mapper)
-    parser.add_argument("--lambda_map_recon", type=float, default=cfg.lambda_map_recon)
-    parser.add_argument("--lambda_map_cos", type=float, default=cfg.lambda_map_cos)
+    parser.add_argument("--lambda_cls_mapper", type=float, default=lambda_cls_mapper)
+    parser.add_argument("--lambda_map_recon", type=float, default=lambda_map_recon)
+    parser.add_argument("--lambda_map_cos", type=float, default=lambda_map_cos)
 
     parser.add_argument("--eval_start_epoch", type=int, default=cfg.eval_start_epoch)
     parser.add_argument("--eval_interval", type=int, default=cfg.eval_interval)
