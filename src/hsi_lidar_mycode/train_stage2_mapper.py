@@ -58,9 +58,9 @@ def _mapper_state_dict(model) -> Dict[str, torch.Tensor]:
         if k.startswith(("map_h_from_l.", "map_l_from_h."))
     }
 
-
+#构造优化器
 def _build_optimizer(model, lr: float, weight_decay: float):
-    params = [p for p in model.parameters() if p.requires_grad]
+    params = [p for p in model.parameters() if p.requires_grad]#只有required_grad为true的时候，才会更新mapper
     if not params:
         raise RuntimeError("No trainable parameters found when building optimizer.")
     return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
@@ -310,7 +310,7 @@ def main(args):
         dropout=args.dropout,
         mapper_num_blocks=args.mapper_num_blocks,
     ).to(device)
-
+    #加载第一阶段训练好的权重
     load_info = model.load_stage1_checkpoint(
         checkpoint_path=args.stage1_ckpt,
         strict=args.strict_stage1_load,
@@ -323,8 +323,8 @@ def main(args):
         len(load_info["unexpected_keys"]),
     )
 
-    model.set_all_trainable(False)
-    model.set_mapper_trainable(True)
+    model.set_all_trainable(False)#把整个模型所有参数都冻结
+    model.set_mapper_trainable(True)#只把mapper部分重新打开训练
     trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters after freezing: %d", trainable_count)
 

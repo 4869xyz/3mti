@@ -29,7 +29,6 @@ class FeatureDiffusionRefiner(nn.Module):
     一步潜变量去噪器，用作扩散风格的特征精炼器
     
     """
-
     def __init__(
         self,
         latent_dim: int = 128,
