@@ -4,17 +4,21 @@ import torch
 import torch.nn as nn
 
 try:
+    from .class_conditioned_compensator import ClassConditionalLatentCompensator, LiDARPriorHead
     from .diffusion_compensator import FeatureConditionalDiffusionCompensator
     from .diffusion_refiner import FeatureDiffusionRefiner
     from .encoders import HSI3DEncoder, LiDAR2DEncoder
     from .fusion_csm import CrossModalSelfAttentionFusion
     from .mapping_heads import DirectionalFeatureMapper
+    from .prototype_memory import PrototypeMemoryBank
 except ImportError:
+    from class_conditioned_compensator import ClassConditionalLatentCompensator, LiDARPriorHead
     from diffusion_compensator import FeatureConditionalDiffusionCompensator
     from diffusion_refiner import FeatureDiffusionRefiner
     from encoders import HSI3DEncoder, LiDAR2DEncoder
     from fusion_csm import CrossModalSelfAttentionFusion
     from mapping_heads import DirectionalFeatureMapper
+    from prototype_memory import PrototypeMemoryBank
 
 
 class Stage2HSILiDARMissingModalityClassifier(nn.Module):
@@ -76,6 +80,24 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             beta_start=diffusion_beta_start,
             beta_end=diffusion_beta_end,
         )
+        self.prototype_bank = PrototypeMemoryBank(
+            num_classes=num_classes,
+            dim=latent_dim,
+        )
+        self.lidar_prior_head = LiDARPriorHead(
+            dim=latent_dim,
+            num_classes=num_classes,
+            hidden_dim=latent_dim,
+            dropout=dropout,
+        )
+        self.lidar_to_hsi_class_cond = ClassConditionalLatentCompensator(
+            latent_dim=latent_dim,
+            hidden_dim=diffusion_hidden_dim,
+            diffusion_steps=diffusion_steps,
+            beta_start=diffusion_beta_start,
+            beta_end=diffusion_beta_end,
+            dropout=0.1,
+        )
 
     def set_backbone_trainable(self, trainable: bool) -> None:
         backbone_modules = [
@@ -100,6 +122,11 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
 
     def set_diffusion_compensator_trainable(self, trainable: bool) -> None:
         for module in [self.lidar_to_hsi, self.hsi_to_lidar]:
+            for param in module.parameters():
+                param.requires_grad = trainable
+
+    def set_hsi_class_cond_trainable(self, trainable: bool) -> None:
+        for module in [self.lidar_prior_head, self.lidar_to_hsi_class_cond]:
             for param in module.parameters():
                 param.requires_grad = trainable
 
@@ -131,6 +158,22 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
         self.lidar_to_hsi.train()
         self.hsi_to_lidar.train()
 
+    def use_hsi_class_cond_train_mode(self) -> None:
+        for module in [
+            self.hsi_encoder,
+            self.lidar_encoder,
+            self.csm,
+            self.diff_refiner,
+            self.classifier,
+            self.map_h_from_l,
+            self.map_l_from_h,
+            self.lidar_to_hsi,
+            self.hsi_to_lidar,
+        ]:
+            module.eval()
+        self.lidar_prior_head.train()
+        self.lidar_to_hsi_class_cond.train()
+
     def load_stage1_checkpoint(
         self,
         checkpoint_path: str,
@@ -141,7 +184,15 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
         state_dict = ckpt.get("model_state_dict", ckpt)
         load_info = self.load_state_dict(state_dict, strict=False)
 
-        ignored_prefixes = ("lidar_to_hsi.", "hsi_to_lidar.", "map_h_from_l.", "map_l_from_h.")
+        ignored_prefixes = (
+            "lidar_to_hsi.",
+            "hsi_to_lidar.",
+            "map_h_from_l.",
+            "map_l_from_h.",
+            "prototype_bank.",
+            "lidar_prior_head.",
+            "lidar_to_hsi_class_cond.",
+        )
         ignored_missing = [k for k in load_info.missing_keys if k.startswith(ignored_prefixes)]
         effective_missing = [k for k in load_info.missing_keys if k not in ignored_missing]
         unexpected = list(load_info.unexpected_keys)
@@ -288,6 +339,65 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             "diff_aux_missing": out_missing["diff_aux"],
         }
 
+    def forward_train_missing_hsi_class_cond(
+        self,
+        hsi: torch.Tensor,
+        lidar: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        prior_temperature: float = 2.0,
+    ) -> Dict[str, torch.Tensor]:
+        encoded = self.encode_modalities(hsi, lidar)
+        z_h = encoded["z_h"]
+        z_l = encoded["z_l"]
+
+        if not self.prototype_bank.has_valid_prototypes(labels):
+            raise RuntimeError("Prototype bank is empty or missing classes. Build it before Stage3A training.")
+
+        z_h_map = self.map_h_from_l(z_l)
+        prior_logits = self.lidar_prior_head(z_l)
+        prior_probs = torch.softmax(prior_logits / prior_temperature, dim=1)
+        class_proto_soft = self.prototype_bank.soft_lookup(prior_probs)
+
+        if labels is not None:
+            class_proto_target = self.prototype_bank.lookup(labels)
+        else:
+            class_proto_target = class_proto_soft
+
+        comp_h = self.lidar_to_hsi_class_cond.training_forward(
+            target=z_h,
+            condition=z_l,
+            init_latent=z_h_map,
+            class_proto=class_proto_soft,
+        )
+        z_h_pred = comp_h["x0_pred"]
+        out_missing = self._classify_from_latents(z_h_pred, z_l)
+
+        with torch.no_grad():
+            out_teacher = self._classify_from_latents(z_h, z_l)
+
+        return {
+            "mode": "hsi_missing_class_cond",
+            "z_h": z_h,
+            "z_l": z_l,
+            "z_h_map": z_h_map,
+            "z_h_pred": z_h_pred,
+            "z_target": z_h,
+            "z_pred": z_h_pred,
+            "class_proto_soft": class_proto_soft,
+            "class_proto_target": class_proto_target,
+            "prior_logits": prior_logits,
+            "prior_probs": prior_probs,
+            "loss_noise": comp_h["loss_noise"],
+            "res_target": comp_h["residual_target"],
+            "res_pred": comp_h["residual_pred"],
+            "logits_missing": out_missing["logits"],
+            "logits_teacher": out_teacher["logits"].detach(),
+            "z_fused_missing": out_missing["z_fused"],
+            "z_refined_missing": out_missing["z_refined"],
+            "aux_missing": out_missing["aux"],
+            "diff_aux_missing": out_missing["diff_aux"],
+        }
+
     def forward_train_missing_lidar(self, hsi: torch.Tensor, lidar: torch.Tensor) -> Dict[str, torch.Tensor]:
         encoded = self.encode_modalities(hsi, lidar)
         z_h = encoded["z_h"]
@@ -357,12 +467,45 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
         }
 
     @torch.no_grad()
+    def forward_mode_hsi_missing_class_cond(
+        self,
+        lidar: torch.Tensor,
+        sampling_steps: Optional[int] = None,
+        prior_temperature: float = 2.0,
+    ) -> Dict[str, torch.Tensor]:
+        if not self.prototype_bank.has_valid_prototypes():
+            raise RuntimeError("Prototype bank is empty. Build or load it before class-conditional inference.")
+
+        z_l = self.lidar_encoder(lidar)
+        z_h_map = self.map_h_from_l(z_l)
+        prior_logits = self.lidar_prior_head(z_l)
+        prior_probs = torch.softmax(prior_logits / prior_temperature, dim=1)
+        class_proto = self.prototype_bank.soft_lookup(prior_probs)
+        z_h_pred = self.lidar_to_hsi_class_cond.sample(
+            condition=z_l,
+            init_latent=z_h_map,
+            class_proto=class_proto,
+            num_steps=sampling_steps,
+        )
+        out = self._classify_from_latents(z_h_pred, z_l)
+        return {
+            "logits": out["logits"],
+            "z_h": z_h_pred,
+            "z_l": z_l,
+            "z_fused": out["z_fused"],
+            "z_refined": out["z_refined"],
+            "prior_logits": prior_logits,
+            "prior_probs": prior_probs,
+        }
+
+    @torch.no_grad()
     def forward_mode(
         self,
         hsi: Optional[torch.Tensor],
         lidar: Optional[torch.Tensor],
         mode: str = "full",
         sampling_steps: Optional[int] = None,
+        prior_temperature: float = 2.0,
     ) -> Dict[str, torch.Tensor]:
         mode = mode.lower().strip()
         if mode in {"full", "full_mapper"}:
@@ -382,6 +525,14 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
             z_l = self.lidar_encoder(lidar)
             z_h_map = self.map_h_from_l(z_l)
             z_h = self.lidar_to_hsi.sample(z_l, num_steps=sampling_steps, init_latent=z_h_map)
+        elif mode in {"hsi_missing_class_cond", "hsi_missing_proto"}:
+            if lidar is None:
+                raise ValueError("Mode 'hsi_missing_class_cond' requires lidar tensor.")
+            return self.forward_mode_hsi_missing_class_cond(
+                lidar=lidar,
+                sampling_steps=sampling_steps,
+                prior_temperature=prior_temperature,
+            )
         elif mode == "lidar_missing":
             if hsi is None:
                 raise ValueError("Mode 'lidar_missing' requires hsi tensor.")
@@ -406,10 +557,17 @@ class Stage2HSILiDARMissingModalityClassifier(nn.Module):
         lidar: Optional[torch.Tensor],
         mode: str = "train",
         sampling_steps: Optional[int] = None,
+        prior_temperature: float = 2.0,
     ) -> Dict[str, torch.Tensor]:
         mode = mode.lower().strip()
         if mode == "train":
             if hsi is None or lidar is None:
                 raise ValueError("Mode 'train' requires both hsi and lidar tensors.")
             return self.forward_train(hsi, lidar)
-        return self.forward_mode(hsi=hsi, lidar=lidar, mode=mode, sampling_steps=sampling_steps)
+        return self.forward_mode(
+            hsi=hsi,
+            lidar=lidar,
+            mode=mode,
+            sampling_steps=sampling_steps,
+            prior_temperature=prior_temperature,
+        )
